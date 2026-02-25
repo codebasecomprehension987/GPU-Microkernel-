@@ -1,0 +1,46 @@
+[package]
+name    = "gpu-microkernel"
+version = "0.1.0"
+edition = "2021"
+
+# ── Host-side binary ──────────────────────────────────────────────────────────
+[[bin]]
+name = "host"
+path = "src/host.rs"
+
+# ── Device-side PTX library ───────────────────────────────────────────────────
+# Compiled separately with `rustc --target nvptx64-nvidia-cuda`
+[lib]
+name       = "gpu_microkernel"
+crate-type = ["cdylib"]  # Produces .ptx via rust-cuda toolchain
+
+# ── Host dependencies ─────────────────────────────────────────────────────────
+[dependencies]
+cust = "0.3"           # High-level CUDA host bindings (CudaDevice, Module, Stream)
+
+# ── Device dependencies (no_std) ─────────────────────────────────────────────
+[target.'cfg(target_os = "cuda")'.dependencies]
+cuda-std = { git = "https://github.com/Rust-GPU/Rust-CUDA", features = ["prelude"] }
+
+# ── Build script (compiles CUDA C++ files and links) ─────────────────────────
+[build-dependencies]
+cuda-builder = { git = "https://github.com/Rust-GPU/Rust-CUDA" }
+
+# ── Profile: release for GPU code (LTO essential for PTX size) ───────────────
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+opt-level     = 3
+panic         = "abort"  # No unwinding on device
+
+[profile.dev]
+opt-level = 1  # Some optimization needed for GPU code even in dev builds
+panic     = "abort"
+
+# ── Features ──────────────────────────────────────────────────────────────────
+[features]
+default          = ["sm_80"]
+sm_70            = []   # Volta (Tesla V100)
+sm_80            = []   # Ampere (A100, RTX 3090)
+sm_90            = []   # Hopper (H100)
+debug_assertions = []   # Enable bounds checking in SharedMem/PoolAllocator
