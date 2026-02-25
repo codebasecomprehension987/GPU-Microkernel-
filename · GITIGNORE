@@ -1,0 +1,54 @@
+# ── CMake ─────────────────────────────────────────────────────────────────────
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# ── Compiled GPU binaries ─────────────────────────────────────────────────────
+*.ptx
+*.cubin
+*.fatbin
+*.o
+*.a
+*.so
+
+# ── Nsight / nvprof profiler output ──────────────────────────────────────────
+*.ncu-rep
+*.nvvp
+*.qdrep
+*.sqlite
+*.nsys-rep
+profile_report*
+
+# ── nvcc dependency files ─────────────────────────────────────────────────────
+*.d
+*.ii
+*.i
+
+# ── Rust / Cargo ──────────────────────────────────────────────────────────────
+target/
+Cargo.lock   # keep for binary crates; remove this line if pure library
+
+# ── Editor configs ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Test / benchmark output ───────────────────────────────────────────────────
+bench_results.txt
+*.log
+!scripts/*.log  # keep script logs
+
+# ── Sanitizer reports ─────────────────────────────────────────────────────────
+sanitizer_*.txt
+memcheck_*.txt
+racecheck_*.txt
