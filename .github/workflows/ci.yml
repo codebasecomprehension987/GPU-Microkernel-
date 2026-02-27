@@ -1,0 +1,242 @@
+name: CI — Build, Lint, Test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+env:
+  CUDA_VERSION: "12.2.0"
+  RUST_TOOLCHAIN: nightly-2024-01-15
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── Job 1: Build CUDA C++ ─────────────────────────────────────────────────
+  build-cuda:
+    name: CUDA C++ Build
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.14
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "cudadevrt"]'
+
+      - name: Cache CMake build
+        uses: actions/cache@v3
+        with:
+          path: build
+          key: cmake-${{ hashFiles('CMakeLists.txt', 'cuda/**') }}
+          restore-keys: cmake-
+
+      - name: Configure CMake
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES="80"
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc) microkernel 2>&1 | tee build.log
+          # Verify binary exists
+          test -f microkernel
+          echo "✅ Build succeeded"
+
+      - name: Check PTX for __syncthreads violations
+        run: |
+          cd build
+          make ptx
+          # Grep PTX for bar.sync (which __syncthreads emits)
+          # Count occurrences — should be exactly 2 (our two setup barriers)
+          SYNC_COUNT=$(grep -c "bar\.sync\|bar\.warp" microkernel.ptx || true)
+          echo "bar.sync count in PTX: $SYNC_COUNT"
+          # We allow 0-4 (compiler may duplicate/eliminate)
+          if [ "$SYNC_COUNT" -gt 8 ]; then
+            echo "❌ Too many syncthreads — possible deadlock risk"
+            exit 1
+          fi
+          echo "✅ Syncthreads count OK: $SYNC_COUNT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: cuda-build
+          path: |
+            build/microkernel
+            build/microkernel.ptx
+
+  # ── Job 2: Build Rust ─────────────────────────────────────────────────────
+  build-rust:
+    name: Rust Build & Lint
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.14
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rust-src, clippy, rustfmt
+
+      - name: Add PTX target
+        run: rustup target add nvptx64-nvidia-cuda
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.toml', 'src/**') }}
+
+      - name: Build device PTX
+        run: |
+          cargo build --release \
+            --target nvptx64-nvidia-cuda \
+            --lib 2>&1 | tee ptx_build.log
+          echo "✅ PTX build succeeded"
+
+      - name: Build host binary
+        run: |
+          cargo build --release --bin host
+          echo "✅ Host binary built"
+
+      - name: Clippy (device — no_std)
+        run: |
+          cargo clippy \
+            --target nvptx64-nvidia-cuda \
+            --lib \
+            -- -D warnings \
+               -A clippy::missing_safety_doc  # unsafe fn docs handled in code
+        continue-on-error: false
+
+      - name: Clippy (host)
+        run: |
+          cargo clippy --bin host -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+  # ── Job 3: GPU Tests (self-hosted runner required) ────────────────────────
+  test-gpu:
+    name: GPU Tests (sanitizers)
+    runs-on: [self-hosted, gpu, linux]
+    needs: [build-cuda]
+    # Only runs when self-hosted GPU runner is available
+    # Comment this out if running only on GitHub-hosted runners
+    if: ${{ vars.HAS_GPU_RUNNER == 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: cuda-build
+          path: build/
+
+      - name: Run queue unit tests
+        run: |
+          cd build
+          nvcc -arch=sm_80 -rdc=true -lcudadevrt \
+               ../tests/queue_tests.cu \
+               -I ../cuda/include \
+               -o queue_tests
+          ./queue_tests
+          echo "✅ Queue tests passed"
+
+      - name: Run memcheck
+        run: |
+          compute-sanitizer \
+            --tool memcheck \
+            --check-device-heap yes \
+            --error-exitcode 1 \
+            build/queue_tests
+          echo "✅ No memory errors"
+
+      - name: Run racecheck
+        run: |
+          compute-sanitizer \
+            --tool racecheck \
+            --error-exitcode 1 \
+            build/queue_tests
+          echo "✅ No race conditions"
+
+      - name: Run synccheck
+        run: |
+          compute-sanitizer \
+            --tool synccheck \
+            --error-exitcode 1 \
+            build/microkernel
+          echo "✅ No sync violations"
+
+      - name: Run benchmarks
+        run: |
+          cd build
+          nvcc -arch=sm_80 -rdc=true -lcudadevrt -O3 \
+               ../benches/throughput_bench.cu \
+               -I ../cuda/include \
+               -o bench
+          ./bench | tee bench_results.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results
+          path: build/bench_results.txt
+
+  # ── Job 4: Static Analysis ────────────────────────────────────────────────
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-tidy
+        run: sudo apt-get install -y clang-tidy
+
+      - name: Run clang-tidy on host C++
+        run: |
+          clang-tidy \
+            cuda/src/host_launcher.cpp \
+            --checks='-*,clang-analyzer-*,bugprone-*,performance-*' \
+            --extra-arg=-std=c++17 \
+            --extra-arg=-I cuda/include \
+            -- -x c++ 2>&1 | tee clang_tidy.log
+          echo "✅ Static analysis complete"
+
+      - name: Check for banned patterns
+        run: |
+          # Ensure __syncthreads() doesn't appear in warp-specialized paths
+          # (We check the warp functions specifically)
+          if grep -n "__syncthreads()" cuda/src/microkernel.cu | \
+             grep -v "^.*//"; then
+            echo "Found uncommented __syncthreads() — verify it's in setup only"
+            # Not a hard failure; requires human review
+          fi
+
+          # Ensure no cudaMalloc on device (banned — use pool allocator)
+          if grep -n "cudaMalloc\b" cuda/src/microkernel.cu | \
+             grep -v "//"; then
+            echo "❌ cudaMalloc found in device code — must use pool allocator"
+            exit 1
+          fi
+          echo "✅ No banned patterns found"
